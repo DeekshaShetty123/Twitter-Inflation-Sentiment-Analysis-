@@ -1,0 +1,396 @@
+def mount_s3_bucket(access_key, secret_key, bucket_name, mount_folder):
+  ACCESS_KEY_ID = access_key
+  SECRET_ACCESS_KEY = secret_key
+  ENCODED_SECRET_KEY = SECRET_ACCESS_KEY.replace("/", "%2F")
+
+  print ("Mounting", bucket_name)
+
+  try:
+    # Unmount the data in case it was already mounted.
+    dbutils.fs.unmount("/mnt/%s" % mount_folder)
+    
+  except:
+    # If it fails to unmount it most likely wasn't mounted in the first place
+    print ("Directory not unmounted: ", mount_folder)
+    
+  finally:
+    # Lastly, mount our bucket.
+    dbutils.fs.mount("s3a://%s:%s@%s" % (ACCESS_KEY_ID, ENCODED_SECRET_KEY, bucket_name), "/mnt/%s" % mount_folder)
+    #dbutils.fs.mount("s3a://"+ ACCESS_KEY_ID + ":" + ENCODED_SECRET_KEY + "@" + bucket_name, mount_folder)
+    print ("The bucket", bucket_name, "was mounted to", mount_folder, "\n")
+    
+# Set AWS programmatic access credentials
+ACCESS_KEY = "AKIA2RX7SARIQH6VQ6ZP"
+SECRET_ACCESS_KEY = "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"
+
+mount_s3_bucket(ACCESS_KEY, SECRET_ACCESS_KEY, 'weclouddata/twitter/Inflation', 'Inf')
+
+pip install vaderSentiment
+
+%fs ls /mnt/Inf/2022/12/09/20
+
+filepath = '/mnt/Inf/*/*/*/*/*'
+
+from pyspark.sql import SparkSession
+
+spark = (SparkSession
+        .builder
+        .appName('Inflation_Analysis')
+        .getOrCreate())
+print('Session created')
+
+sc = spark.sparkContext
+
+from pyspark.sql.types import StructType, StructField, StringType, TimestampType
+
+schema = StructType([
+    StructField('id', StringType(), True),
+    StructField('name', StringType(), True),
+    StructField('username', StringType(), True),
+    StructField('tweet', StringType(), True), 
+    StructField('followers_count', StringType(), True), 
+    StructField('location', StringType(), True),
+    StructField('geo', StringType(), True),
+    StructField('created_at', StringType(), True)
+])
+
+Inflation_Analysis = (spark.read.option('delimiter','\t').option('header','false').schema(schema).csv(filepath))
+
+Inflation_Analysis.count()
+
+from pyspark.sql.functions import col, isnull
+Inflation_Analysis = Inflation_Analysis.na.drop(subset=['tweet'])
+
+Inflation_Analysis = Inflation_Analysis.dropDuplicates()
+
+Inflation_Analysis = Inflation_Analysis.drop("id", "geo")
+
+from pyspark.sql.functions import col
+
+Inflation_Analysis = Inflation_Analysis.filter("created_at >= 'Wed Dec 14 00:00:00 +0000 2022'")
+
+Inflation_Analysis.write.option('header', 'false').parquet('/mnt/my_bucket/project/Inflation_Analysis_reduced.parquet')
+
+Inflation_Analysis.count()
+
+import pyspark.sql.functions as F
+df_sentiment = Inflation_Analysis.withColumn('tweet', F.regexp_replace('tweet', r"http\S+", "")) \
+                    .withColumn('tweet', F.regexp_replace('tweet', r"[^a-zA-Z]", " ")) \
+                    .withColumn('tweet', F.regexp_replace('tweet', r"\s+", " ")) \
+                    .withColumn('tweet', F.lower('tweet')) \
+                    .withColumn('tweet', F.trim('tweet')) 
+display(df_sentiment)
+
+from pyspark.ml.feature import Tokenizer
+tokenizer = Tokenizer(inputCol="tweet", outputCol="tokens")
+df_sentiment = tokenizer.transform(df_sentiment)
+
+display(df_sentiment)
+
+#now remove stopwords from the review(list of words)    
+from pyspark.ml.feature import StopWordsRemover
+
+stopword_remover = StopWordsRemover(inputCol="tokens", outputCol="filtered")
+df_sentiment = stopword_remover.transform(df_sentiment)
+
+display(df_sentiment)
+
+from pyspark.ml.feature import CountVectorizer
+
+cv = CountVectorizer(vocabSize=2**16, inputCol="filtered", outputCol='cv')
+cv_model = cv.fit(df_sentiment)
+df_sentiment_1 = cv_model.transform(df_sentiment)
+
+display(df_sentiment_1)
+
+from pyspark.ml.feature import HashingTF, IDF
+
+idf = IDF(inputCol='cv', outputCol ='features', minDocFreq = 5)
+idf_model = idf.fit(df_sentiment_1)
+df_sentiment_2 = idf_model.transform(df_sentiment_1)
+
+from pyspark.sql.types import FloatType, StructType, StructField, StringType, IntegerType
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from pyspark.ml.base import Transformer
+from pyspark.ml.param.shared import HasInputCol, HasOutputCol
+
+
+# Define a UDF to perform sentiment analysis
+def sentiment_analysis(text):
+    analyzer = SentimentIntensityAnalyzer()
+    scores = analyzer.polarity_scores(text)
+    return (scores['compound'], scores['pos'], scores['neg'], scores['neu'])
+
+class SentimentAnalysisTransformer(Transformer, HasInputCol, HasOutputCol):
+    def __init__(self, inputCol, outputCol):
+        self.inputCol = inputCol
+        self.outputCol = outputCol
+
+    def _transform(self, dataset):
+        # Define the UDF
+        sentiment_udf = udf(sentiment_analysis, StructType([
+            StructField('compound', FloatType(), True),
+            StructField('positive', FloatType(), True),
+            StructField('negative', FloatType(), True),
+            StructField('neutral', FloatType(), True)
+        ]))
+        # Register the UDF
+        SparkSession.getActiveSession().udf.register(sentiment_udf)
+        return dataset.withColumn(self.outputCol, sentiment_udf(dataset[self.inputCol]))
+
+# Create a new column called "label" with the desired labels
+def sentiment_label(compound):
+    if compound > 0:
+        return 2
+    elif compound < 0:
+        return 1
+    else:
+        return 0
+    
+class SentimentLabelTransformer(Transformer, HasInputCol, HasOutputCol):
+    def __init__(self, inputCol, outputCol):
+        self.inputCol = inputCol
+        self.outputCol = outputCol
+
+    def _transform(self, dataset):
+        # Define the UDF
+        sentiment_label_udf = udf(sentiment_label, IntegerType())
+        # Register the UDF
+        SparkSession.getActiveSession().udf.register(sentiment_label_udf)
+        return dataset.withColumn(self.outputCol, sentiment_label_udf(dataset[self.inputCol].getItem('compound'))) 
+    
+# Use the UDF to add a new column to the DataFrame
+df_sentiment_2 = df_sentiment_2.withColumn('sentiment', sentiment_udf(df_sentiment_2['tweet']))
+    
+# Register the UDF
+sentiment_label_udf = udf(sentiment_label, IntegerType())
+
+# Extract the compound, positive, negative, and neutral columns from the sentiment column
+df_final = df_sentiment_2.withColumn('compound', df_sentiment_2['sentiment'].getItem('compound'))
+df_final = df_final.withColumn('positive', df_sentiment_2['sentiment'].getItem('positive'))
+df_final = df_final.withColumn('negative', df_sentiment_2['sentiment'].getItem('negative'))
+df_final = df_final.withColumn('neutral', df_sentiment_2['sentiment'].getItem('neutral'))
+
+
+    
+# Create a new column called "label" with the desired labels
+df_final = df_final.withColumn("label", sentiment_label_udf(df_final['compound']))
+
+# View the results
+display(df_final)
+
+from pyspark.sql.types import FloatType, StructType, StructField, StringType
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+# Define a UDF to perform sentiment analysis
+def sentiment_analysis(text):
+    analyzer = SentimentIntensityAnalyzer()
+    scores = analyzer.polarity_scores(text)
+    return (scores['compound'], scores['pos'], scores['neg'], scores['neu'])
+  
+# Register the UDF
+sentiment_udf = udf(sentiment_analysis, StructType([
+    StructField('compound', FloatType(), True),
+    StructField('positive', FloatType(), True),
+    StructField('negative', FloatType(), True),
+    StructField('neutral', FloatType(), True)
+]))
+
+    
+# Use the UDF to add a new column to the DataFrame
+df_sentiment_2 = df_sentiment_2.withColumn('sentiment', sentiment_udf(df_sentiment_2['tweet']))
+
+# Extract the compound, positive, negative, and neutral columns from the sentiment column
+df_final = df_sentiment_2.withColumn('compound', df_sentiment_2['sentiment'].getItem('compound'))
+df_final = df_final.withColumn('positive', df_sentiment_2['sentiment'].getItem('positive'))
+df_final = df_final.withColumn('negative', df_sentiment_2['sentiment'].getItem('negative'))
+df_final = df_final.withColumn('neutral', df_sentiment_2['sentiment'].getItem('neutral'))
+
+
+# View the results
+display(df_final)
+
+from pyspark.sql.functions import when, col
+
+# Create a new column called "label" with the desired labels
+df_final = df_final.withColumn("label", when(col("compound") > 0, 2).when(col("compound") < 0, 1).otherwise(0))
+display(df_final)
+
+df_final.write.option('header', 'false').parquet('/mnt/my_bucket/project/df_final.parquet')
+
+df_final_athena = df_final.select(['name', 'username', 'tweet','followers_count', 'location', 'created_at', 'label'])
+
+df_final_athena.printSchema()
+
+df_final_athena.write.option('header', 'false').parquet('/mnt/my_bucket/project/df_final_athena.parquet')
+
+# Select the desired columns from the DataFrame
+df_final_ml = df_final.select(['username', 'tweet', 'features', 'label'])
+
+df_final_ml.cache()
+
+df_final_ml.count()
+
+df_final_ml.write.option('header', 'false').parquet('/mnt/my_bucket/project/df_final_ml.parquet')
+
+# Split the DataFrame into training and test sets
+trainDF, testDF = df_final_ml.randomSplit([0.7, 0.3], seed=42)
+# Print the number of training and test examples
+print("We have {} training examples and {} test examples.".format(trainDF.count(), testDF.count()))
+
+display(testDf)
+
+display(trainDF)
+
+from pyspark.ml.classification import RandomForestClassifier
+
+# Create a random forest classifier
+rfr = RandomForestClassifier(labelCol="label", seed=27, numTrees=3, maxDepth=10)
+
+# Fit the model to the training data
+model = rfr.fit(trainDF)
+
+# Make predictions on the test data
+predictions = model.transform(testDF)
+
+# Display the predictions
+display(predictions)
+
+predictions.write.option('header', 'false').parquet('/mnt/my_bucket/project/predictions_rf_new.parquet')
+
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+# Create the evaluator
+evaluator = MulticlassClassificationEvaluator()
+roc = evaluator.evaluate(predictions)
+accuracy = predictions.filter(predictions.label== predictions.prediction).count()
+print("Accuracy Score: {0:.4f}".format(accuracy))/ float(testDF)
+print("ROC-AUC: {0:.4f}".format(roc))
+
+from pyspark.ml.classification import LogisticRegression
+
+# Create the logistic regression classifier
+lr = LogisticRegression(maxIter=10, regParam=0.01, labelCol="label")
+
+# Fit the model on the training set
+model = lr.fit(trainDF)
+
+# Make predictions on the test set
+predictions_2 = model.transform(testDF)
+display(predictions_2)
+
+predictions_2.printSchema()
+
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+# Create the evaluator
+evaluator = MulticlassClassificationEvaluator()
+roc = evaluator.evaluate(predictions_2)
+accuracy = predictions_2.filter(predictions_2.label== predictions_2.prediction).count()/float(testDF)
+print("Accuracy Score: {0:.4f}".format(accuracy))
+print("ROC-AUC: {0:.4f}".format(roc))
+
+predictions_2.write.option('header', 'false').parquet('/mnt/my_bucket/project/predictions_lr_new.parquet')
+
+from pyspark.ml.classification import LinearSVC, OneVsRest
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+
+# Create the linear SVM classifier
+lsvm = LinearSVC(maxIter=10, regParam=0.1)
+
+# Create the one-vs-rest classifier
+ovr = OneVsRest(classifier=lsvm, labelCol="label")
+
+# Fit the model on the training set
+model = ovr.fit(trainDF)
+
+# Make predictions on the test set
+predictions_4 = model.transform(testDF)
+
+# Evaluate the model using the multiclass classification evaluator
+evaluator = MulticlassClassificationEvaluator(predictionCol="prediction")
+accuracy = evaluator.evaluate(predictions_4)
+print("Accuracy: {0:.4f}".format(accuracy))
+
+predictions_4.write.option('header', 'false').parquet('/mnt/my_bucket/project/predictions_svm_new.parquet')
+
+from pyspark.sql.types import FloatType, StructType, StructField, StringType
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from pyspark.ml.feature import Tokenizer, StopWordsRemover, CountVectorizer, IDF
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml import Pipeline
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+
+# Use 70% cases for training, 30% cases for testing
+train, test = df_final_ml.randomSplit([0.7, 0.3], seed=42)
+
+# Create transformers for the ML pipeline
+tokenizer = Tokenizer(inputCol="tweet", outputCol="tokens")
+stopword_remover = StopWordsRemover(inputCol="tokens", outputCol="filtered")
+cv = CountVectorizer(vocabSize=2**16, inputCol="filtered", outputCol='cv')
+idf = IDF(inputCol='cv', outputCol="idf_features", minDocFreq=5) #minDocFreq: remove sparse terms
+
+# Define the SentimentAnalysisTransformer and SentimentLabelTransformer transformers
+#sentiment_analysis_transformer = SentimentAnalysisTransformer(inputCol="tweet", outputCol="sentiment")
+#sentiment_label_transformer = SentimentLabelTransformer(inputCol="sentiment", outputCol="label")
+
+# Regression model estimator
+lr = LogisticRegression(featuresCol="idf_features")
+
+# Build the pipeline
+pipeline = Pipeline(stages=[tokenizer, stopword_remover, cv, idf, sentiment_analysis_transformer, sentiment_label_transformer, lr])
+
+# Pipeline model fitting
+pipeline_model = pipeline.fit(train)
+predictions = pipeline_model.transform(test)
+
+evaluator = MulticlassClassificationEvaluator(labelCol="label", predictionCol="prediction", metricName="accuracy")
+accuracy = evaluator.evaluate(predictions)
+print("Accuracy: {0:.4f}".format(accuracy))
+
+
+from pyspark.sql.types import FloatType, StructType, StructField, StringType
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from pyspark.ml.feature import NGram, StopWordsRemover, HashingTF, IDF, Tokenizer, StringIndexer, NGram, VectorAssembler
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml import Pipeline
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+
+# Use 70% cases for training, 30% cases for testing
+train, test = df_final_ml.randomSplit([0.7, 0.3], seed=42)
+
+# Create transformers for the ML pipeline
+tokenizer = Tokenizer(inputCol="tweet", outputCol="tokens")
+stopword_remover = StopWordsRemover(inputCol="tokens", outputCol="filtered")
+cv = CountVectorizer(vocabSize=2**16, inputCol="filtered", outputCol='cv')
+idf = IDF(inputCol='cv', outputCol="1gram_idf", minDocFreq=5) #minDocFreq: remove sparse terms
+ngram = NGram(n=2, inputCol="filtered", outputCol="2gram")
+ngram_hashingtf = HashingTF(inputCol="2gram", outputCol="2gram_tf", numFeatures=20000)
+ngram_idf = IDF(inputCol='2gram_tf', outputCol="2gram_idf", minDocFreq=5) 
+
+# Assemble all text features
+assembler = VectorAssembler(inputCols=["1gram_idf", "2gram_tf"], outputCol="features")
+
+# Define the SentimentAnalysisTransformer and SentimentLabelTransformer transformers
+sentiment_analysis_transformer = SentimentAnalysisTransformer(inputCol="tweet", outputCol="sentiment")
+sentiment_label_transformer = SentimentLabelTransformer(inputCol="sentiment", outputCol="label")
+
+# Regression model estimator
+lr = LogisticRegression(featuresCol="features")
+
+# Build the pipeline
+pipeline = Pipeline(stages=[tokenizer, stopword_remover, cv, idf, sentiment_analysis_transformer, sentiment_label_transformer, lr])
+
+# Pipeline model fitting
+pipeline_model = pipeline.fit(train)
+predictions = pipeline_model.transform(test)
+
+evaluator = MulticlassClassificationEvaluator(labelCol="label", predictionCol="prediction", metricName="accuracy")
+accuracy = evaluator.evaluate(predictions)
+print("Accuracy: {0:.4f}".format(accuracy))
