@@ -20,8 +20,8 @@ def mount_s3_bucket(access_key, secret_key, bucket_name, mount_folder):
     print ("The bucket", bucket_name, "was mounted to", mount_folder, "\n")
     
 # Set AWS programmatic access credentials
-ACCESS_KEY = "AKIA2RX7SARIQH6VQ6ZP"
-SECRET_ACCESS_KEY = "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"
+ACCESS_KEY = ""
+SECRET_ACCESS_KEY = ""
 
 mount_s3_bucket(ACCESS_KEY, SECRET_ACCESS_KEY, 'weclouddata/twitter/Inflation', 'Inf')
 
